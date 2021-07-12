@@ -28,9 +28,9 @@ openreplay代码分析
 ### tracker 中涉及的接口
 
 只有3个，相对比较直观：
-1. /v1/web/not-started：客户端api不满足要求，无法录制
-2. /v1/web/start：客户端开始录制
-3. /v1/web/i：发送录制数据给后端
+1. /v1/web/not-started：客户端api不满足要求，无法录制(主程序调用)
+2. /v1/web/start：客户端开始录制(主程序调用，返回的token会传给webworker，后续的数据上传需要)
+3. /v1/web/i：发送录制数据给后端(由webworker调用)
 
 这3个接口的实现位于 `backend/services/http/main.go` 中
 
@@ -57,7 +57,7 @@ tracker是前端数据收集器，由核心和插件组成，这里主要分析�
     - app app核心
     - modules 各个模块
   - messages 消息格式定义
-  - webworker webworker
+  - webworker 发送数据
 ```
 
 `messages`下面定义了`tracker`支持的所有消息格式及编码实现，比如`boolean/uint/int/string`数据都会编码到一个`Uint8Array`中，具体编码方式可以查看`/tracker/src/messages/writer.ts`。
@@ -116,7 +116,8 @@ tracker是前端数据收集器，由核心和插件组成，这里主要分析�
 ```
 
 ### webworker
-tracker采用主程序与webworker通信的方式交互，交互方式有：
+
+webworker主要用来发送收集到的数据给服务器(调用/v1/web/i接口)，与主程序通过postMessage进行通信。
 
 主程序向webworker发送的消息有：
 ```
@@ -149,4 +150,105 @@ webworker中出现不可恢复的错误(比如达到重试次数还没有上传�
 出现授权失败或页面不可见超过5分钟时触发
 ```
 
-writer作为消息缓存区，大小设置为`4 * 1e5`，也就是`400kB`，表示每次数据提交最多为`400kB`
+webworker内部的实现细节有：
+1. writer作为消息缓存区，大小设置为`4 * 1e5`，也就是`400kB`，表示每批数据提交最多为`400kB`。注意内部有队列
+2. 内部定时器为20秒，如果不通过`this.worker.postMessage(null)`立即上传的话，所有传给webworker的数据都按照这个定时器进行上传。
+3. 主程序传给webworker的所有消息，都会被编码到内部缓冲区writer中，具体编码方法参考每个`Message.encode()`方法
+
+
+## app实例构造流程
+
+我们在使用 OpenReplay 的时候，通常是下面这样：
+```js
+const tracker = new Tracker({
+  projectKey: '',
+  ingestPoint: 'https://ingest.openreplay.com/',
+  obscureInputNumbers: false,
+  obscureInputEmails: false,
+  defaultInputMode: 0,
+  onStart() {},
+});
+tracker.start()
+```
+
+首先是实例化一个`Tracker`实例，逻辑如下：
+1. 检测客户端api是否满足要求，比如`Map`、`Set`、`MutationObserver`、`performance`、`Blob`、`Worker`等api是否存在，因为tracker代码依赖这些api。
+如果客户端不满足这些要求，则直接调用`/v1/web/not-started`接口告知服务器。
+   
+2. `new App(projectKey, sessionToken, options)`实例化一个`App`实例
+App内部有3个核心组件：Nodes/Observer/Ticker
+在这一步中，还会初始化好webworker，并设置好worker与主程序的通信方式(绑定message事件)
+
+3. 初始化各个模块，比如`Viewport`模块、`CSSRules`模块、`Input`模块、`Scroll`模块等。
+并且把`tracker`实例保存在`window.__OPENREPLAY__`变量上。
+
+
+接着，调用`tracker.start()`启动tracker实例
+tracker的start方法是封装了app.start方法，调用start方法时，主程序通过postMessage将配置传给worker来启动worker内部的定时器开始工作，同时启动app内部的三个组件：observer/ticker开始工作。
+再然后，主程序调用`/v1/web/start`接口获取到本次会话的token，传给worker，后续worker内部调用`/v1/web/i`接口时需要通过这个token进行认证。
+
+至此，tracker启动成功。
+
+## 我们接下来分析app内部的3个核心组件: Nodes、Observer、Ticker
+
+### Ticker
+
+我们在`new App()`的时候，调用了如下代码：
+```js
+this.ticker = new Ticker(this)
+this.ticker.attach(() => this.commit())
+```
+
+`Ticker`的构造器很简单，如下：
+```js
+class Ticker {
+    constructor(app) {
+        this.app = app
+        this.callbacks = []
+    }
+    attach(callback) {
+        this.callbacks.unshift(callback)
+    }
+    start() {
+        if (this.timer === null) {
+            this.timer = setInterval(() => {
+                this.callbacks.forEach(cb => cb())
+            }, 30)
+        }
+    }
+    stop() {
+        if (this.timer !== null) {
+            clearInterval(this.timer)
+            this.timer = null
+        }
+    }
+}
+```
+
+然后，我们在启动`tracker`的时候调用了
+```js
+this.ticker.start();
+```
+
+可以看出来，`Ticker`功能很简单，就是一个定时器，每隔30毫秒执行一遍绑定的回调函数。在我们的代码里面，我们只在ticker上面绑定了一个回调函数，那就是`() => this.commit()`，而这个`commit`的代码如下：
+```js
+function commit() {
+    if (this.worker && this.messages.length) {
+        this.messages.unshift(new Timestamp())
+        this.worker.postMessage(this.messages)
+        this.messages.length = 0
+    }
+}
+```
+也就是说，每隔30毫秒，我们就把app实例上面收集的所有消息，提交给worker线程，然后我们可以通过`this.worker.postMessage(null)`主动告诉worker提交这些数据，或者等待worker内部的计时器(20秒)触发提交。
+
+## Observer
+
+同样，我们在`new App()`的时候调用
+```js
+this.observer = new Observer(this, this.options);
+```
+在启动tracker的时候调用
+```js
+this.observer.observe();
+```
