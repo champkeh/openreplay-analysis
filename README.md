@@ -4,7 +4,7 @@ openreplay代码分析
 ## 项目介绍
 
 ### OpenReplay
-[OpenReplay](https://github.com/openreplay/openreplay) 是一款web会话录制与回放的整套解决方案，包含前端tracker与后端数据处理于一体，可一键部署到kubernetes中。
+[OpenReplay](https://github.com/openreplay/openreplay) 是一款web会话录制与回放的整套解决方案，包含前端tracker、dashboard以及后端数据处理于一体，并可一键部署到kubernetes中。
 
 ### OpenReplay-Analysis (本项目)
 理清OpenReplay项目中的代理逻辑，方面进行二次开发及修复bug。
@@ -14,13 +14,13 @@ openreplay代码分析
 
 ```
 - openreplay
-  - api 网站前端的接口，python实现
-  - backend 数据后端收集与处理，golang实现
+  - api 前端dashboard的接口，python实现
+  - backend 后端数据收集与处理，golang实现
   - ee 企业版相关代码
-  - frontend 网站前端，react实现
+  - frontend 前端dashboard，react实现
   - scripts 部署脚本
   - sourcemap-uploader 暂未分析
-  - tracker 前端tracker代码
+  - tracker 前端tracker
 ```
 
 ## 接口
@@ -30,7 +30,7 @@ openreplay代码分析
 只有3个，相对比较直观：
 1. /v1/web/not-started：客户端api不满足要求，无法录制(主程序调用)
 2. /v1/web/start：客户端开始录制(主程序调用，返回的token会传给webworker，后续的数据上传需要)
-3. /v1/web/i：发送录制数据给后端(由webworker调用)
+3. /v1/web/i：发送录制数据给后端(webworker调用)
 
 这3个接口的实现位于 `backend/services/http/main.go` 中
 
@@ -57,7 +57,7 @@ tracker是前端数据收集器，由核心和插件组成，这里主要分析�
     - app app核心
     - modules 各个模块
   - messages 消息格式定义
-  - webworker 发送数据
+  - webworker worker线程，用来发送数据
 ```
 
 `messages`下面定义了`tracker`支持的所有消息格式及编码实现，比如`boolean/uint/int/string`数据都会编码到一个`Uint8Array`中，具体编码方式可以查看`/tracker/src/messages/writer.ts`。
@@ -156,7 +156,9 @@ webworker内部的实现细节有：
 3. 主程序传给webworker的所有消息，都会被编码到内部缓冲区writer中，具体编码方法参考每个`Message.encode()`方法
 
 
-## app实例构造流程
+### 主程序
+
+#### app实例构造流程
 
 我们在使用 OpenReplay 的时候，通常是下面这样：
 ```js
@@ -184,14 +186,14 @@ App内部有3个核心组件：Nodes/Observer/Ticker
 
 
 接着，调用`tracker.start()`启动tracker实例
-tracker的start方法是封装了app.start方法，调用start方法时，主程序通过postMessage将配置传给worker来启动worker内部的定时器开始工作，同时启动app内部的三个组件：observer/ticker开始工作。
+tracker的start方法是封装了app.start方法，调用start方法时，主程序通过postMessage将配置数据传给worker来启动worker内部的定时器开始工作，同时启动app内部的三个组件：observer/ticker开始工作。
 再然后，主程序调用`/v1/web/start`接口获取到本次会话的token，传给worker，后续worker内部调用`/v1/web/i`接口时需要通过这个token进行认证。
 
 至此，tracker启动成功。
 
-## 我们接下来分析app内部的3个核心组件: Nodes、Observer、Ticker
+我们接下来分析app内部的3个核心组件: Nodes、Observer、Ticker
 
-### Ticker
+#### Ticker
 
 我们在`new App()`的时候，调用了如下代码：
 ```js
@@ -242,7 +244,32 @@ function commit() {
 ```
 也就是说，每隔30毫秒，我们就把app实例上面收集的所有消息，提交给worker线程，然后我们可以通过`this.worker.postMessage(null)`主动告诉worker提交这些数据，或者等待worker内部的计时器(20秒)触发提交。
 
-## Observer
+#### Nodes
+
+nodes的相关代码只在实例化app的时候有如下代码：
+```js
+this.nodes = new Nodes(this.options.node_id)
+```
+
+然后在`app.stop()`的时候有如下代码：
+```js
+this.nodes.clear()
+```
+
+我们简化下`Nodes`相关代码，如下：
+```js
+class Nodes {
+    constructor(node_id) {
+        this.node_id = node_id
+        this.nodes = []
+        this.nodeCallbacks = []
+        this.elementListeners = new Map()
+    }
+}
+```
+应该是在其他地方使用了，我们后续碰到时再分析。
+
+#### Observer
 
 同样，我们在`new App()`的时候调用
 ```js
@@ -251,4 +278,37 @@ this.observer = new Observer(this, this.options);
 在启动tracker的时候调用
 ```js
 this.observer.observe();
+```
+
+简化`Observer`代码如下：
+```js
+class Observer {
+    constructor(app, opts) {
+        this.app = app
+        this.options = opts
+        this.observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                
+            }
+            this.comitNodes()
+        })
+        this.comited = []
+        this.recents = []
+        this.indexes = [0]
+        this.attributesList = []
+        this.textSet = new Set()
+        this.textasked = new Set()
+    }
+    observe() {
+        this.observer.observe(document, {
+            childList: true,
+            attributes: true,
+            characterData: true,
+            subtree: true,
+            attributeOldValue: false,
+            characterDataOldValue: false,
+        })
+        this.app.send(new CreateDocument())
+    }
+}
 ```
