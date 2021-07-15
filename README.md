@@ -265,9 +265,17 @@ class Nodes {
         this.nodeCallbacks = []
         this.elementListeners = new Map()
     }
+    registerNode(node) {
+        
+    }
+    unregisterNode(node) {
+        
+    }
+    getID(node) {}
+    getNode(id) {}
 }
 ```
-应该是在其他地方使用了，我们后续碰到时再分析。
+这个组件主要用于处理dom树中的节点与id的一一对应，对于每一个被跟踪的dom节点，都会被绑定一个id值。这个id值会作为内部各种数组容器的下标，用来表示对应的节点。根元素`html`的id值为0，后续节点根据注册的先后顺序依次自增。
 
 #### Observer
 
@@ -310,5 +318,64 @@ class Observer {
         })
         this.app.send(new CreateDocument())
     }
+    _commitNode(id, node) {}
 }
 ```
+`Observer`用于跟踪整颗dom树的变化，并把变化以消息的形式记录下来发送给`this.app.messages`中，最终通过webworker发送给服务器。
+
+这个类里面的核心应该是`_commitNode(id, node)`方法。
+
+## 模块
+
+各个模块的功能就是不断地给app发送消息，然后app将这些消息同步到webworker，由worker提交给服务器。服务器在后端去处理这些消息
+
+
+## 跟踪一次完整的 message 记录
+
+![img.png](img.png)
+![img_1.png](img_1.png)
+
+首先以`Timestamp`开头，这在每批数据开头都会自动添加的。然后就是对整个dom树的序列化，用了大概1400多个message来记录，中间会忽略特定的标签，比如`meta`、`link`、`title`、`script`等，此过程依据不同的文档大小有所不同。
+从上面的截图中可以知道，本次的dom序列化占用了1433个message。
+
+接下来是一个`SetPageLocation`、`SetViewportSize`，`SetPageVisibility`，`SetViewportScroll`。
+
+接下来就是一些性能方面的数据，比如`PerformanceTrack`、`ResourceTiming`、`PageLoadTiming`、`PageRenderTiming`。
+
+此时，如果页面上没有任何事件的话，则只会出现`Timestamp`和`PerformanceTrack`这两个消息，如下：
+
+![img_2.png](img_2.png)
+
+中间会夹杂着一些特定操作导致的事件，比如js异常:
+
+![img_3.png](img_3.png)
+
+上面这张图中，js异常也会导致dom的变化，这是因为项目中开启了vConsole，而vConsole记录的数据都是通过dom保存的。
+
+本次录制过程中，也出现了2条`ConnectionInformation`异常的事件：
+
+![img_4.png](img_4.png)
+
+以及切换浏览器tab导致的`SetPageVisibility`事件：
+
+![img_5.png](img_5.png)
+
+`LongTask`事件：
+
+![img_6.png](img_6.png)
+![img_7.png](img_7.png)
+
+通过观察本次录制的数据，发现中间突然多了这样一些记录：
+![img_8.png](img_8.png)
+通过分析，知道了这些dom操作原来是本地发送的请求导致的，如下：
+![img_9.png](img_9.png)
+
+由此可知，接口调用对应的消息类型是`ResourceTiming`。我们可以屏蔽vConsole所在的根元素，避免这部分不必要的记录。
+
+
+下面是点击页面上面的按钮，跳转新页面的过程：
+![img_10.png](img_10.png)
+![img_11.png](img_11.png)
+
+从图中可知，先是`MouseMove`、`MouseClick`事件，`MouseClick`的`label`就是按钮的名字。然后跟着一个`ResourceTiming`事件，表示动态加载资源，也就是我们的新页面的js，因为我们项目开启了动态import路由的机制。
+接下来就是把新页面渲染到视图中，也就是一系列dom操作。最后有一个`SetPageLocation`，表示我们的路由已经导航到新的页面地址了。
