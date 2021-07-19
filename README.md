@@ -14,3 +14,4 @@ openreplay代码分析
 
 - [项目架构分析](architecture.md)
 - [记一次完整的消息录制过程](record/index.md)
+- [插件架构](plugin-arch.md)
